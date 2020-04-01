@@ -828,8 +828,8 @@ void BytecodeInterpreter::run(interpreterState istate)
                 interesting = true;
             }
         }
-#endif // HACK
-        // returned from a java call, continue executing.
+#endif // HACK \
+    // returned from a java call, continue executing.
         if (THREAD->pop_frame_pending() && !THREAD->pop_frame_in_process()) {
             goto handle_Pop_Frame;
         }
