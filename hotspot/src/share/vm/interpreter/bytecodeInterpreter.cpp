@@ -1878,15 +1878,25 @@ run:
 
             /* monitorenter and monitorexit for locking/unlocking an object */
 
+            /*
+             * 以32位Mark Word为例进行说明
+             */
             CASE(_monitorenter)
                 :
             {
+                //Java锁对象
                 oop lockee = STACK_OBJECT(-1);
+
                 // derefing's lockee ought to provoke implicit null check
                 CHECK_NULL(lockee);
+
                 // find a free monitor or one already allocated for this object
                 // if we find a matching object then we need a new monitor
                 // since this is recursive enter
+
+                /**
+                 * 线程栈中找到内存地址尽量高的未使用Lock Record，未使用的Lock Record的_obj字段为NULL
+                 */
                 BasicObjectLock* limit = istate->monitor_base();
                 BasicObjectLock* most_recent = (BasicObjectLock*)istate->stack_base();
                 BasicObjectLock* entry = NULL;
@@ -1897,27 +1907,60 @@ run:
                         break;
                     most_recent++;
                 }
+
                 if (entry != NULL) {
+                    //设置Lock Record的_obj字段为lockee这个Java锁对象
                     entry->set_obj(lockee);
+
                     int success = false;
+
+                    //markOopDesc类定义在markOop.hpp文件
+
+                    //中间两个Epoch比特位为1，其他都为0
                     uintptr_t epoch_mask_in_place = (uintptr_t)markOopDesc::epoch_mask_in_place;
 
+                    //lockee这个Java锁对象对应的当前Mark Word
                     markOop mark = lockee->mark();
+
+                    //全比特位都为0
                     intptr_t hash = (intptr_t)markOopDesc::no_hash;
+
                     // implies UseBiasedLocking
                     if (mark->has_bias_pattern()) {
+                        //表示最低3比特位为101
+
                         uintptr_t thread_ident;
                         uintptr_t anticipated_bias_locking_value;
+
+                        //当前线程对象
                         thread_ident = (uintptr_t)istate->thread();
+
+                        //((uintptr_t)lockee->klass()->prototype_header() | thread_ident)：
+                        // 表示Java锁对象对应类对象的原型Mark Word（CMW，除了Epoch和锁标志位具有含义，其他位置比特位都为0） | 线程ID，
+                        // 结果R是"线程ID，CMW的Epoch，CMW的对象分代年龄，CMW的锁标志位"
+
+                        //((uintptr_t)markOopDesc::age_mask_in_place)：中间4个分代年龄比特位为1，其他都为0
                         anticipated_bias_locking_value = (((uintptr_t)lockee->klass()->prototype_header() | thread_ident) ^ (uintptr_t)mark) & ~((uintptr_t)markOopDesc::age_mask_in_place);
 
+                        //anticipated_bias_locking_value的最终结果含义：排除掉分代年龄比特位，比较当前Mark Word与R在“线程ID，Epoch，锁标志位”3部分的不同
+
                         if (anticipated_bias_locking_value == 0) {
+
+                            //3部分完全相同，表明再次偏向当前线程，偏向锁重入，通过entry这个Lock Record对象正确表达了锁重入语义
+
                             // already biased towards this thread, nothing to do
                             if (PrintBiasedLockingStatistics) {
                                 (*BiasedLocking::biased_lock_entry_count_addr())++;
                             }
                             success = true;
                         } else if ((anticipated_bias_locking_value & markOopDesc::biased_lock_mask_in_place) != 0) {
+
+                            //markOopDesc::biased_lock_mask_in_place：表示最低3位锁标志比特位为0
+
+                            //进入到这里表示3部分比较中，锁标志位不同，结合`if (mark->has_bias_pattern())`，也就是说：
+                            // Java锁对象对应类对象的原型Mark Word中锁标志位不为101，即需要关闭偏向锁，这个关闭偏向锁是由后续介绍的启发式更新机制设置的
+                            //故这里撤销锁
+
                             // try revoke bias
                             markOop header = lockee->klass()->prototype_header();
                             if (hash != markOopDesc::no_hash) {
@@ -1929,11 +1972,16 @@ run:
                             }
                         } else if ((anticipated_bias_locking_value & epoch_mask_in_place) != 0) {
                             // try rebias
+
+                            //表示原来获取偏向锁的线程已经执行完成，允许重偏向
+
+                            //目标Mark Word是“当前线程ID，CMW的Epoch，CMW的分代年龄，CMW的锁标志位（这里是101）”
                             markOop new_header = (markOop)((intptr_t)lockee->klass()->prototype_header() | thread_ident);
                             if (hash != markOopDesc::no_hash) {
                                 new_header = new_header->copy_set_hash(hash);
                             }
                             if (Atomic::cmpxchg_ptr((void*)new_header, lockee->mark_addr(), mark) == mark) {
+                                //成功重偏向
                                 if (PrintBiasedLockingStatistics)
                                     (*BiasedLocking::rebiased_lock_entry_count_addr())++;
                             } else {
@@ -1941,15 +1989,23 @@ run:
                             }
                             success = true;
                         } else {
+
+                            //执行到这里，表示3部分比较只有线程ID不同
+
                             // try to bias towards thread in case object is anonymously biased
                             markOop header = (markOop)((uintptr_t)mark & ((uintptr_t)markOopDesc::biased_lock_mask_in_place | (uintptr_t)markOopDesc::age_mask_in_place | epoch_mask_in_place));
                             if (hash != markOopDesc::no_hash) {
                                 header = header->copy_set_hash(hash);
                             }
                             markOop new_header = (markOop)((uintptr_t)header | thread_ident);
+
+                            //目标Mark Word就是替换现有的线程ID为当前线程ID
+
                             // debugging hint
                             DEBUG_ONLY(entry->lock()->set_displaced_header((markOop)(uintptr_t)0xdeaddead);)
+
                             if (Atomic::cmpxchg_ptr((void*)new_header, lockee->mark_addr(), header) == header) {
+                                //成功重偏向
                                 if (PrintBiasedLockingStatistics)
                                     (*BiasedLocking::anonymously_biased_lock_entry_count_addr())++;
                             } else {
@@ -1961,12 +2017,24 @@ run:
 
                     // traditional lightweight locking
                     if (!success) {
+
+                        //执行到这里，表示是从撤销锁那个条件分行直接过来的，或者直接是不可偏向状态
+
+                        //这个表示最低1位比特位设为1，这个其实主要是针对原来是轻量级锁和重量级锁的情形
                         markOop displaced = lockee->mark()->set_unlocked();
+
+                        //如果是第一次申请轻量级锁成功，entry这个Lock Record需要设置将来用于还原的Mark Word
                         entry->lock()->set_displaced_header(displaced);
+
+                        //表示直接使用重量级锁的VM参数
                         bool call_vm = UseHeavyMonitors;
+
                         if (call_vm || Atomic::cmpxchg_ptr(entry, lockee->mark_addr(), displaced) != displaced) {
+                            //轻量级锁申请失败
+
                             // Is it simple recursive case?
                             if (!call_vm && THREAD->is_lock_owned((address)displaced->clear_lock_bits())) {
+                                //轻量级锁重入，这里是通过指向线程栈中锁记录指针去拿的
                                 entry->lock()->set_displaced_header(NULL);
                             } else {
                                 CALL_VM(InterpreterRuntime::monitorenter(THREAD, entry), handle_exception);
@@ -1975,6 +2043,7 @@ run:
                     }
                     UPDATE_PC_AND_TOS_AND_CONTINUE(1, -1);
                 } else {
+                    // 线程栈中找不到内存地址尽量高的未使用Lock Record，一般情况下并不会运行到这里
                     istate->set_msg(more_monitors);
                     UPDATE_PC_AND_RETURN(0); // Re-execute
                 }
