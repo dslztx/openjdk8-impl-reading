@@ -1916,7 +1916,7 @@ run:
 
                     //markOopDesc类定义在markOop.hpp文件
 
-                    //中间两个Epoch比特位为1，其他都为0
+                    //Epoch字段的两个比特位为1，其他都为0
                     uintptr_t epoch_mask_in_place = (uintptr_t)markOopDesc::epoch_mask_in_place;
 
                     //lockee这个Java锁对象对应的当前Mark Word
@@ -1948,6 +1948,8 @@ run:
 
                             //3部分完全相同，表明再次偏向当前线程，偏向锁重入，通过entry这个Lock Record对象正确表达了锁重入语义
 
+                            //不过这里也可能是假性“锁重入”，即偏向锁已经被释放掉，那么就相当于第一次偏向
+
                             // already biased towards this thread, nothing to do
                             if (PrintBiasedLockingStatistics) {
                                 (*BiasedLocking::biased_lock_entry_count_addr())++;
@@ -1958,7 +1960,7 @@ run:
                             //markOopDesc::biased_lock_mask_in_place：表示最低3位锁标志比特位为0
 
                             //进入到这里表示3部分比较中，锁标志位不同，结合`if (mark->has_bias_pattern())`，也就是说：
-                            // Java锁对象对应类对象的原型Mark Word中锁标志位不为101，即需要关闭偏向锁，这个关闭偏向锁是由后续介绍的启发式更新机制设置的
+                            //Java锁对象对应类对象的原型Mark Word中锁标志位不为101，即需要关闭偏向锁，这个关闭偏向锁是由后续介绍的启发式更新机制设置的
                             //故这里撤销锁
 
                             // try revoke bias
@@ -1966,10 +1968,13 @@ run:
                             if (hash != markOopDesc::no_hash) {
                                 header = header->copy_set_hash(hash);
                             }
+
+                            //先尝试撤销成无锁状态
                             if (Atomic::cmpxchg_ptr(header, lockee->mark_addr(), mark) == mark) {
                                 if (PrintBiasedLockingStatistics)
                                     (*BiasedLocking::revoked_lock_entry_count_addr())++;
                             }
+
                         } else if ((anticipated_bias_locking_value & epoch_mask_in_place) != 0) {
                             // try rebias
 
@@ -1993,6 +1998,7 @@ run:
                             //执行到这里，表示3部分比较只有线程ID不同
 
                             // try to bias towards thread in case object is anonymously biased
+                            // 只有当前是匿名偏向的时候才允许去进行重偏向
                             markOop header = (markOop)((uintptr_t)mark & ((uintptr_t)markOopDesc::biased_lock_mask_in_place | (uintptr_t)markOopDesc::age_mask_in_place | epoch_mask_in_place));
                             if (hash != markOopDesc::no_hash) {
                                 header = header->copy_set_hash(hash);
@@ -2018,15 +2024,17 @@ run:
                     // traditional lightweight locking
                     if (!success) {
 
-                        //执行到这里，表示是从撤销锁那个条件分行直接过来的，或者直接是不可偏向状态
+                        //执行到这里，表示是从撤销锁那个条件分支直接过来的，或者直接是不可偏向状态
 
-                        //这个表示最低1位比特位设为1，这个其实主要是针对原来是轻量级锁和重量级锁的情形
+                        //这个表示最低1位比特位设为1，这个其实主要是针对原来是轻量级锁和重量级锁的情形，原来是无锁的才允许去
+                        //申请轻量级锁
                         markOop displaced = lockee->mark()->set_unlocked();
 
-                        //如果是第一次申请轻量级锁成功，entry这个Lock Record需要设置将来用于还原的Mark Word
+                        //如果是第一次申请轻量级锁成功，entry这个Lock Record的displaced_header需要设置将来用于还原的Mark Word
                         entry->lock()->set_displaced_header(displaced);
 
-                        //表示直接使用重量级锁的VM参数
+                        // 如果指定了-XX:+UseHeavyMonitors，则call_vm=true，代表禁用偏向锁和轻量级锁
+                        // 表示直接使用重量级锁的VM参数
                         bool call_vm = UseHeavyMonitors;
 
                         if (call_vm || Atomic::cmpxchg_ptr(entry, lockee->mark_addr(), displaced) != displaced) {
@@ -2034,7 +2042,7 @@ run:
 
                             // Is it simple recursive case?
                             if (!call_vm && THREAD->is_lock_owned((address)displaced->clear_lock_bits())) {
-                                //轻量级锁重入，这里是通过指向线程栈中锁记录指针去拿的
+                                //轻量级锁重入，这个displaced_header应该设置为NULL
                                 entry->lock()->set_displaced_header(NULL);
                             } else {
                                 CALL_VM(InterpreterRuntime::monitorenter(THREAD, entry), handle_exception);
@@ -2061,14 +2069,20 @@ run:
                 while (most_recent != limit) {
                     if ((most_recent)->obj() == lockee) {
                         BasicLock* lock = most_recent->lock();
+
+                        //在设置重量级锁的时候，lock->set_displaced_header(markOopDesc::unused_mark());
+                        //而且是每个Lock Record都设置的
                         markOop header = lock->displaced_header();
                         most_recent->set_obj(NULL);
+
+                        // 如果是偏向模式，仅仅释放Lock Record就好了。否则要走轻量级锁 or 重量级锁的释放流程
                         if (!lockee->mark()->has_bias_pattern()) {
                             bool call_vm = UseHeavyMonitors;
                             // If it isn't recursive we either must swap old header or call the runtime
                             if (header != NULL || call_vm) {
                                 if (call_vm || Atomic::cmpxchg_ptr(header, lockee->mark_addr(), lock) != lock) {
                                     // restore object for the slow case
+                                    // CAS失败或者是重量级锁则会走到这里，先将obj还原，然后调用monitorexit()方法
                                     most_recent->set_obj(lockee);
                                     CALL_VM(InterpreterRuntime::monitorexit(THREAD, most_recent), handle_exception);
                                 }
