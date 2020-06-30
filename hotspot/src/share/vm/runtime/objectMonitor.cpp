@@ -328,6 +328,8 @@ void ATTR ObjectMonitor::enter(TRAPS)
 
     cur = Atomic::cmpxchg_ptr(Self, &_owner, NULL);
     if (cur == NULL) {
+        //该重量级锁之前未被占有，当下被THREAD线程占有
+
         // Either ASSERT _recursions == 0 or explicitly set _recursions = 0.
         assert(_recursions == 0, "invariant");
         assert(_owner == Self, "invariant");
@@ -336,16 +338,24 @@ void ATTR ObjectMonitor::enter(TRAPS)
     }
 
     if (cur == Self) {
+        //重量级锁锁重入
         // TODO-FIXME: check for integer overflow!  BUGID 6557169.
         _recursions++;
         return;
     }
 
     if (Self->is_lock_owned((address)cur)) {
+        // 当前线程是之前持有该轻量级锁的线程，由轻量级锁膨胀且第一次调用enter方法
+
         assert(_recursions == 0, "internal state error");
+        // 重入计数重置为1
         _recursions = 1;
         // Commute owner from a thread-specific on-stack BasicLockObject address to
         // a full-fledged "Thread *".
+
+        // 设置owner字段为当前线程（之前owner是指向Lock Record的指针）
+        // 而且OwnerIsThread=1，当为0时，表示指向的就是一个Lock Record指针
+
         _owner = Self;
         OwnerIsThread = 1;
         return;
@@ -360,6 +370,8 @@ void ATTR ObjectMonitor::enter(TRAPS)
     // transitions.  The following spin is strictly optional ...
     // Note that if we acquire the monitor from an initial spin
     // we forgo posting JVMTI events and firing DTRACE probes.
+
+    //先尝试自旋获得锁
     if (Knob_SpinEarly && TrySpin(Self) > 0) {
         assert(_owner == Self, "invariant");
         assert(_recursions == 0, "invariant");
@@ -410,13 +422,14 @@ void ATTR ObjectMonitor::enter(TRAPS)
 
             EnterI(THREAD);
 
+            //这里才是一般的退出路径，也只有在这里才能退出
             if (!ExitSuspendEquivalent(jt))
                 break;
 
             //
             // We have acquired the contended monitor, but while we were
             // waiting another thread suspended us. We don't want to enter
-            // the monitor while suspended because that would surprise the
+            // the monitor while suspended（这描述的是啥场景？） because that would surprise the
             // thread that suspended us.
             //
             _recursions = 0;
@@ -514,7 +527,11 @@ void ATTR ObjectMonitor::EnterI(TRAPS)
     assert(((JavaThread*)Self)->thread_state() == _thread_blocked, "invariant");
 
     // Try the lock - TATAS
+    // 尝试获得锁
     if (TryLock(Self) > 0) {
+
+        //尝试占有该重量级锁
+
         assert(_succ != Self, "invariant");
         assert(_owner == Self, "invariant");
         assert(_Responsible != Self, "invariant");
@@ -531,6 +548,8 @@ void ATTR ObjectMonitor::EnterI(TRAPS)
     // effects.
 
     if (TrySpin(Self) > 0) {
+        //再次尝试占有该重量级锁
+
         assert(_owner == Self, "invariant");
         assert(_succ != Self, "invariant");
         assert(_Responsible != Self, "invariant");
@@ -570,12 +589,16 @@ void ATTR ObjectMonitor::EnterI(TRAPS)
         // Interference - the CAS failed because _cxq changed.  Just retry.
         // As an optional optimization we retry the lock.
         if (TryLock(Self) > 0) {
+
+            //再次尝试占有该重量级锁
             assert(_succ != Self, "invariant");
             assert(_owner == Self, "invariant");
             assert(_Responsible != Self, "invariant");
             return;
         }
     }
+
+    //到这里，说明进入cxq队列
 
     // Check for cxq|EntryList edge transition to non-null.  This indicates
     // the onset of contention.  While contention persists exiting threads
@@ -600,9 +623,19 @@ void ATTR ObjectMonitor::EnterI(TRAPS)
     // timer scalability issues we see on some platforms as we'd only have one thread
     // -- the checker -- parked on a timer.
 
+    // 为了避免重量级锁退出时可能存在的“Stranding”情形，在cxq或者EntryList中选举一个“Responsible”线程，它不是无限park，
+    // 而是有限park，即固定一段时候后，会复活看自己能不能获取锁。
+    // “Stranding”情形的另外一种解决方案是有一个固定的checker线程固定时间去查看所有“cxq或者EntryList”上的线程，看能否获取锁，
+    // 这种方案的一个好处，在有些平台上存在定时器扩展性问题，第2种解决方案相对第1种解决方案，只需要一个
+    // 定时器，不存在扩展性问题了
+
     if ((SyncFlags & 16) == 0 && nxt == NULL && _EntryList == NULL) {
+        // SyncFlags默认为0，如果没有其他等待的线程，则将_Responsible线程设置为自己
+
         // Try to assume the role of responsible thread for the monitor.
         // CONSIDER:  ST vs CAS vs { if (Responsible==null) Responsible=Self }
+
+        // 表示只有当前线程在cxq队列中，选举它作为_Responsible线程
         Atomic::cmpxchg_ptr(Self, &_Responsible, NULL);
     }
 
@@ -617,6 +650,8 @@ void ATTR ObjectMonitor::EnterI(TRAPS)
     // to defer the state transitions until absolutely necessary,
     // and in doing so avoid some transitions ...
 
+    //在加入cxq队列的操作中，可能锁可获得了，再次尝试下，因为最后的操作非常重型
+
     TEVENT(Inflated enter - Contention);
     int nWakeups = 0;
     int RecheckInterval = 1;
@@ -625,15 +660,20 @@ void ATTR ObjectMonitor::EnterI(TRAPS)
 
         if (TryLock(Self) > 0)
             break;
+
         assert(_owner != Self, "invariant");
 
         if ((SyncFlags & 2) && _Responsible == NULL) {
+            //还是要找个"Responsible"线程
             Atomic::cmpxchg_ptr(Self, &_Responsible, NULL);
         }
 
         // park self
         if (_Responsible == Self || (SyncFlags & 1)) {
             TEVENT(Inflated enter - park TIMED);
+
+            //有时间限制的park，而且这个时间限制非固定的
+
             Self->_ParkEvent->park((jlong)RecheckInterval);
             // Increase the RecheckInterval, but clamp the value.
             RecheckInterval *= 8;
@@ -641,9 +681,12 @@ void ATTR ObjectMonitor::EnterI(TRAPS)
                 RecheckInterval = 1000;
         } else {
             TEVENT(Inflated enter - park UNTIMED);
+
+            //无限park
             Self->_ParkEvent->park();
         }
 
+        //走到这里表示挂起线程重新运行了，可能是固定时间到了，也可能是调用了unpark()方法
         if (TryLock(Self) > 0)
             break;
 
@@ -652,6 +695,8 @@ void ATTR ObjectMonitor::EnterI(TRAPS)
         // Note that the counter is not protected by a lock or updated by atomics.
         // That is by design - we trade "lossy" counters which are exposed to
         // races during updates for a lower probe effect.
+
+        //无效的唤醒，进行非线程安全的计数，因为不需要很精确
         TEVENT(Inflated enter - Futile wakeup);
         if (ObjectMonitor::_sync_FutileWakeups != NULL) {
             ObjectMonitor::_sync_FutileWakeups->inc();
@@ -662,6 +707,8 @@ void ATTR ObjectMonitor::EnterI(TRAPS)
         // We can defer clearing _succ until after the spin completes
         // TrySpin() must tolerate being called with _succ == Self.
         // Try yet another round of adaptive spinning.
+
+        //再次尝试自旋获取锁
         if ((Knob_SpinAfterFutile & 1) && TrySpin(Self) > 0)
             break;
 
@@ -675,6 +722,8 @@ void ATTR ObjectMonitor::EnterI(TRAPS)
 
         if ((Knob_ResetEvent & 1) && Self->_ParkEvent->fired()) {
             Self->_ParkEvent->reset();
+
+            //内存屏障
             OrderAccess::fence();
         }
         if (_succ == Self)
@@ -684,16 +733,23 @@ void ATTR ObjectMonitor::EnterI(TRAPS)
         OrderAccess::fence();
     }
 
+    //到这里为止，成功获得锁
+
     // Egress :
     // Self has acquired the lock -- Unlink Self from the cxq or EntryList.
-    // Normally we'll find Self on the EntryList .
+    // Normally we'll find Self on the EntryList（正常情况下应该在EntryList队列中找到） .
+
     // From the perspective of the lock owner (this thread), the
     // EntryList is stable and cxq is prepend-only.
     // The head of cxq is volatile but the interior is stable.
+
+    //从本线程的视角看，EntryList是稳定的，因为不存在释放锁，cxq的头部会插入新的线程，cxq的内部也是稳定的
+
     // In addition, Self.TState is stable.
 
     assert(_owner == Self, "invariant");
     assert(object() != NULL, "invariant");
+
     // I'd like to write:
     //   guarantee (((oop)(object()))->mark() == markOopDesc::encode(this), "invariant") ;
     // but as we're at a safepoint that's not safe.
@@ -705,6 +761,7 @@ void ATTR ObjectMonitor::EnterI(TRAPS)
     assert(_succ != Self, "invariant");
     if (_Responsible == Self) {
         _Responsible = NULL;
+        //内存屏障
         OrderAccess::fence(); // Dekker pivot-point
 
         // We may leave threads on cxq|EntryList without a designated
@@ -714,7 +771,6 @@ void ATTR ObjectMonitor::EnterI(TRAPS)
         // by LDing cxq|EntryList.  Newly arrived threads -- that is, threads
         // that arrive on cxq after the ST:MEMBAR, above -- will set Responsible
         // non-null and elect a new "Responsible" timer thread.
-        //
         // This thread executes:
         //    ST Responsible=null; MEMBAR    (in enter epilog - here)
         //    LD cxq|EntryList               (in subsequent exit)
@@ -750,7 +806,9 @@ void ATTR ObjectMonitor::EnterI(TRAPS)
     // monitorexit.  Recall too, that in 1-0 mode monitorexit does not necessarily
     // execute a serializing instruction.
 
+    //主要是处理内存可见性问题
     if (SyncFlags & 8) {
+        //内存屏障
         OrderAccess::fence();
     }
     return;
@@ -906,6 +964,7 @@ void ObjectMonitor::UnlinkAfterAcquire(Thread* Self, ObjectWaiter* SelfNode)
             // In that case Self must be in the interior and can no longer be
             // at the head of cxq.
             if (v == SelfNode) {
+                //表明是CAS操作失败进到这里，然后v指向跟_cxq已经不一样了
                 assert(_cxq != v, "invariant");
                 v = _cxq; // CAS above failed - start scan at head of list
             }
@@ -926,6 +985,8 @@ void ObjectMonitor::UnlinkAfterAcquire(Thread* Self, ObjectWaiter* SelfNode)
     }
 
     // Diagnostic hygiene ...
+
+    //最终清理现场
     SelfNode->_prev = (ObjectWaiter*)0xBAD;
     SelfNode->_next = (ObjectWaiter*)0xBAD;
     SelfNode->TState = ObjectWaiter::TS_RUN;
@@ -987,7 +1048,9 @@ void ATTR ObjectMonitor::exit(bool not_suspended, TRAPS)
     Thread* Self = THREAD;
     if (THREAD != _owner) {
         if (THREAD->is_lock_owned((address)_owner)) {
-            // Transmute _owner from a BasicLock pointer to a Thread address.
+            // 本来可能是轻量级锁，还没调用enter方法，因为轻量级锁膨胀成重量级锁可能是由计算hashcode引起的，owner是个Lock Record地址
+
+            // Transmute _owner from a BasicObjectLock pointer to a Thread address.
             // We don't need to hold _mutex for this transition.
             // Non-null to Non-null is safe as long as all readers can
             // tolerate either flavor.
@@ -1009,6 +1072,8 @@ void ATTR ObjectMonitor::exit(bool not_suspended, TRAPS)
     }
 
     if (_recursions != 0) {
+
+        //重量级锁锁重入，最简单的释放处理方案
         _recursions--; // this is simple recursive enter
         TEVENT(Inflated exit - recursive);
         return;
@@ -1032,6 +1097,8 @@ void ATTR ObjectMonitor::exit(bool not_suspended, TRAPS)
         assert(THREAD == _owner, "invariant");
 
         if (Knob_ExitPolicy == 0) {
+            // code 1：先释放锁，这时如果有其他线程进入同步块则能获得锁
+
             // release semantics: prior loads and stores from within the critical section
             // must not float (reorder) past the following store that drops the lock.
             // On SPARC that requires MEMBAR #loadstore|#storestore.
@@ -1047,6 +1114,8 @@ void ATTR ObjectMonitor::exit(bool not_suspended, TRAPS)
             OrderAccess::release_store_ptr(&_owner, NULL); // drop the lock
             OrderAccess::storeload(); // See if we need to wake a successor
             if ((intptr_t(_EntryList) | intptr_t(_cxq)) == 0 || _succ != NULL) {
+                //如果没有等待的线程或已经有假定继承人（因为是并发的）
+
                 TEVENT(Inflated exit - simple egress);
                 return;
             }
@@ -1090,6 +1159,7 @@ void ATTR ObjectMonitor::exit(bool not_suspended, TRAPS)
             // falls to the new owner.
             //
             if (Atomic::cmpxchg_ptr(THREAD, &_owner, NULL) != NULL) {
+                // code 3：要执行之后的操作需要重新获得锁，即设置_owner为当前线程
                 return;
             }
             TEVENT(Exit - Reacquired);
@@ -1124,15 +1194,20 @@ void ATTR ObjectMonitor::exit(bool not_suspended, TRAPS)
             }
         }
 
+        //接下来这里是去正式唤醒的流程
+
         guarantee(_owner == THREAD, "invariant");
 
         ObjectWaiter* w = NULL;
+        // code 4：根据QMode的不同会有不同的唤醒策略，默认为0
         int QMode = Knob_QMode;
 
         if (QMode == 2 && _cxq != NULL) {
             // QMode == 2 : cxq has precedence over EntryList.
             // Try to directly wake a successor from the cxq.
-            // If successful, the successor will need to unlink itself from cxq.
+            // If successful, the successor will need to unlink itself from cxq. 自己去做
+            // QMode == 2 : cxq中的线程有更高优先级，直接唤醒cxq的队首线程
+
             w = _cxq;
             assert(w != NULL, "invariant");
             assert(w->TState == ObjectWaiter::TS_CXQ, "Invariant");
@@ -1146,6 +1221,9 @@ void ATTR ObjectMonitor::exit(bool not_suspended, TRAPS)
             // Drain _cxq into EntryList - bulk transfer.
             // First, detach _cxq.
             // The following loop is tantamount to: w = swap (&cxq, NULL)
+
+            //清空cxq，然后将整个链加到EntryList后面
+
             w = _cxq;
             for (;;) {
                 assert(w != NULL, "Invariant");
@@ -1183,6 +1261,7 @@ void ATTR ObjectMonitor::exit(bool not_suspended, TRAPS)
         if (QMode == 4 && _cxq != NULL) {
             // Aggressively drain cxq into EntryList at the first opportunity.
             // This policy ensure that recently-run threads live at the head of EntryList.
+            // 这个注释文字写错了，明显是挂到队首
 
             // Drain _cxq into EntryList - bulk transfer.
             // First, detach _cxq.
@@ -1229,6 +1308,8 @@ void ATTR ObjectMonitor::exit(bool not_suspended, TRAPS)
             // reacquires the lock and then finds itself on the EntryList.
             // Given all that, we have to tolerate the circumstance where "w" is
             // associated with Self.
+
+            // 如果EntryList不为空，则直接唤醒EntryList的队首元素
             assert(w->TState == ObjectWaiter::TS_ENTER, "invariant");
             ExitEpilog(Self, w);
             return;
@@ -1236,6 +1317,8 @@ void ATTR ObjectMonitor::exit(bool not_suspended, TRAPS)
 
         // If we find that both _cxq and EntryList are null then just
         // re-run the exit protocol from the top.
+
+        // EntryList为null，则处理cxq中的元素
         w = _cxq;
         if (w == NULL)
             continue;
@@ -1267,6 +1350,8 @@ void ATTR ObjectMonitor::exit(bool not_suspended, TRAPS)
         if (QMode == 1) {
             // QMode == 1 : drain cxq to EntryList, reversing order
             // We also reverse the order of the list.
+
+            // QMode == 1 : 将cxq中的元素转移到EntryList，并反转顺序
             ObjectWaiter* s = NULL;
             ObjectWaiter* t = w;
             ObjectWaiter* u = NULL;
@@ -1283,6 +1368,8 @@ void ATTR ObjectMonitor::exit(bool not_suspended, TRAPS)
             assert(s != NULL, "invariant");
         } else {
             // QMode == 0 or QMode == 2
+
+            // 将cxq中的元素转移到EntryList
             _EntryList = w;
             ObjectWaiter* q = NULL;
             ObjectWaiter* p;
@@ -1300,11 +1387,15 @@ void ATTR ObjectMonitor::exit(bool not_suspended, TRAPS)
         // See if we can abdicate to a spinner instead of waking a thread.
         // A primary goal of the implementation is to reduce the
         // context-switch rate.
+
+        // _succ不为null，说明已经有个继承人了，所以不需要当前线程去唤醒，减少上下文切换的比率
         if (_succ != NULL)
             continue;
 
         w = _EntryList;
         if (w != NULL) {
+            // 唤醒EntryList第一个元素
+
             guarantee(w->TState == ObjectWaiter::TS_ENTER, "invariant");
             ExitEpilog(Self, w);
             return;
