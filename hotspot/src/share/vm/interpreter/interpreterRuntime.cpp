@@ -616,15 +616,26 @@ thread->last_frame().interpreter_frame_verify_monitor(elem);
 if (PrintBiasedLockingStatistics) {
     Atomic::inc(BiasedLocking::slow_path_entry_count_addr());
 }
+
+//thread当前线程
+//elem 表示拟使用的Lock Record
+//elem-obj() 表示Java锁对象
 Handle h_obj(thread, elem->obj());
+
 assert(Universe::heap()->is_in_reserved_or_null(h_obj()),
     "must be NULL or an object");
+
 if (UseBiasedLocking) {
+    // -XX:+UseBiasedLocking 开启了偏向锁
+
     // Retry fast entry if bias is revoked to avoid unnecessary inflation
+    // 如果开启了偏向锁模式，那么根据进入本方法的所有可能情形，还是存在当初申请偏向锁由于竞争失败，
+    // 但是现在申请偏向锁可成功的可能，需要再度尝试
     ObjectSynchronizer::fast_enter(h_obj, elem->lock(), true, CHECK);
 } else {
     ObjectSynchronizer::slow_enter(h_obj, elem->lock(), CHECK);
 }
+
 assert(Universe::heap()->is_in_reserved_or_null(elem->obj()),
     "must be NULL or an object");
 #ifdef ASSERT
