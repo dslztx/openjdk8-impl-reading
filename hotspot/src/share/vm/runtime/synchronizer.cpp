@@ -176,16 +176,21 @@ void ObjectSynchronizer::fast_enter(Handle obj, BasicLock* lock, bool attempt_re
 {
     if (UseBiasedLocking) {
         if (!SafepointSynchronize::is_at_safepoint()) {
+            // 非VM线程（正常的情形就是非VM线程），撤销和重偏向
             BiasedLocking::Condition cond = BiasedLocking::revoke_and_rebias(obj, attempt_rebias, THREAD);
             if (cond == BiasedLocking::BIAS_REVOKED_AND_REBIASED) {
+                // 重偏向成功，直接返回
                 return;
             }
         } else {
+            // VM线程执行到这里，attempt_rebias必为false
             assert(!attempt_rebias, "can not rebias toward VM thread");
             BiasedLocking::revoke_at_safepoint(obj);
         }
         assert(!obj->mark()->has_bias_pattern(), "biases should be revoked by now");
     }
+
+    // fast_enter跟slow_enter方法相比就是再度尝试申请偏向锁，如果成功直接返回
 
     slow_enter(obj, lock, THREAD);
 }
@@ -197,6 +202,7 @@ void ObjectSynchronizer::fast_exit(oop object, BasicLock* lock, TRAPS)
     markOop dhw = lock->displaced_header();
     markOop mark;
     if (dhw == NULL) {
+        // 重入锁，什么也不做
         // Recursive stack-lock.
         // Diagnostics -- Could be: stack-locked, inflating, inflated.
         mark = object->mark();
@@ -239,8 +245,13 @@ void ObjectSynchronizer::slow_enter(Handle obj, BasicLock* lock, TRAPS)
     assert(!mark->has_bias_pattern(), "should not see bias pattern here");
 
     if (mark->is_neutral()) {
+        // 本来是无锁
+
         // Anticipate successful CAS -- the ST of the displaced mark must
         // be visible <= the ST performed by the CAS.
+
+        // 第一次申请轻量级锁，把displaced_header设置好
+
         lock->set_displaced_header(mark);
         if (mark == (markOop)Atomic::cmpxchg_ptr(lock, obj()->mark_addr(), mark)) {
             TEVENT(slow_enter
@@ -249,8 +260,10 @@ void ObjectSynchronizer::slow_enter(Handle obj, BasicLock* lock, TRAPS)
         }
         // Fall through to inflate() ...
     } else if (mark->has_locker() && THREAD->is_lock_owned((address)mark->locker())) {
+        // 轻量级锁锁重入
         assert(lock != mark->locker(), "must not re-lock the same lock");
         assert(lock != (BasicLock*)obj->mark(), "don't relock with same BasicLock");
+        // 轻量级锁锁重入，那么displaced_header只需要为空就可以
         lock->set_displaced_header(NULL);
         return;
     }
@@ -267,7 +280,11 @@ void ObjectSynchronizer::slow_enter(Handle obj, BasicLock* lock, TRAPS)
     // so it does not matter what the value is, except that it
     // must be non-zero to avoid looking like a re-entrant lock,
     // and must not look locked either.
+
+    // 申请重量级锁，displaced_header设置成对应于重量级锁的一个特殊值
     lock->set_displaced_header(markOopDesc::unused_mark());
+
+    // 申请重量级锁对象，即ObjectMonitor对象，然后调用enter方法尝试去获得该重量级锁
     ObjectSynchronizer::inflate(THREAD, obj())->enter(THREAD);
 }
 
@@ -1233,14 +1250,15 @@ ObjectMonitor* ATTR ObjectSynchronizer::inflate(Thread* Self, oop object)
         assert(!mark->has_bias_pattern(), "invariant");
 
         // The mark can be in one of the following states:
-        // *  Inflated     - just return
-        // *  Stack-locked - coerce it to inflated
-        // *  INFLATING    - busy wait for conversion to complete
-        // *  Neutral      - aggressively inflate the object.
-        // *  BIASED       - Illegal.  We should never see this
+        // *  Inflated     - just return，即重量级锁状态
+        // *  Stack-locked - coerce it to inflated，即轻量级锁状态
+        // *  INFLATING    - busy wait for conversion to complete，一个额外的中间状态
+        // *  Neutral      - aggressively inflate the object，即无锁状态
+        // *  BIASED       - Illegal.  We should never see this，即偏向锁状态，这里不可能再遇到偏向锁状态
 
         // CASE: inflated
         if (mark->has_monitor()) {
+            //已经是重量级锁状态，直接返回该重量级锁对象
             ObjectMonitor* inf = mark->monitor();
             assert(inf->header()->is_neutral(), "invariant");
             assert(inf->object() == object, "invariant");
@@ -1255,8 +1273,12 @@ ObjectMonitor* ATTR ObjectSynchronizer::inflate(Thread* Self, oop object)
         // Currently, we spin/yield/park and poll the markword, waiting for inflation to finish.
         // We could always eliminate polling by parking the thread on some auxiliary list.
         if (mark == markOopDesc::INFLATING()) {
+            // 还处于中间状态，继续自旋
+            // 正在膨胀中，说明另一个线程正在进行锁膨胀，continue重试
             TEVENT(Inflate
                    : spin while INFLATING);
+
+            // 在该方法中会进行spin/yield/park等操作完成自旋动作
             ReadStableMark(object);
             continue;
         }
@@ -1281,12 +1303,17 @@ ObjectMonitor* ATTR ObjectSynchronizer::inflate(Thread* Self, oop object)
         // See the comments in omAlloc().
 
         if (mark->has_locker()) {
+            //处于轻量级锁状态
+
+            //分配一个重量级锁对象
             ObjectMonitor* m = omAlloc(Self);
+
             // Optimistically prepare the objectmonitor - anticipate successful CAS
             // We do this before the CAS in order to minimize the length of time
             // in which INFLATING appears in the mark.
             m->Recycle();
             m->_Responsible = NULL;
+            //OwnerIsThread=0表示_owner字段的值是Lock Record的指针
             m->OwnerIsThread = 0;
             m->_recursions = 0;
             m->_SpinDuration = ObjectMonitor::Knob_SpinLimit; // Consider: maintain by type/class
@@ -1337,6 +1364,8 @@ ObjectMonitor* ATTR ObjectSynchronizer::inflate(Thread* Self, oop object)
             // m->OwnerIsThread = 1. Note that a thread can inflate an object
             // that it has stack-locked -- as might happen in wait() -- directly
             // with CAS.  That is, we can avoid the xchg-NULL .... ST idiom.
+
+            //mark->locker返回的是一个Lock Record的指针
             m->set_owner(mark->locker());
             m->set_object(object);
             // TODO-FIXME: assert BasicLock->dhw != 0.
@@ -1344,6 +1373,8 @@ ObjectMonitor* ATTR ObjectSynchronizer::inflate(Thread* Self, oop object)
             // Must preserve store ordering. The monitor state must
             // be stable at the time of publishing the monitor address.
             guarantee(object->mark() == markOopDesc::INFLATING(), "invariant");
+
+            //状态转换为INFLATED
             object->release_set_mark(markOopDesc::encode(m));
 
             // Hopefully the performance counters are allocated on distinct cache lines
@@ -1372,6 +1403,8 @@ ObjectMonitor* ATTR ObjectSynchronizer::inflate(Thread* Self, oop object)
         // to inflate and then CAS() again to try to swing _owner from NULL to Self.
         // An inflateTry() method that we could call from fast_enter() and slow_enter()
         // would be useful.
+
+        //无锁状态
 
         assert(mark->is_neutral(), "invariant");
         ObjectMonitor* m = omAlloc(Self);
